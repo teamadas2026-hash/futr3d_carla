@@ -1,0 +1,37 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+.Python
+
+# IDE
+.vscode/
+.opencode/
+.idea/
+*.swp
+*.swo
+
+# Workspace artifacts
+.DS_Store
+.env
+*.log
+
+# Large datasets and generated files
+data/nuscenes/
+Carla_Nuscenes/datasets/
+Carla_Nuscenes/nuscenes_output/
+
+# Model checkpoints - keep folder structure empty
+checkpoints/*
+!checkpoints/.gitkeep
+
+# Generated outputs
+outputs/
+work_dirs/lidar_0075v_cam_vov/
+test/carla_nuscenes/
+graphify-out/
+
+# Specific checkpoint file
+realtime/epoch_12.pth
