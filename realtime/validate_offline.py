@@ -1,139 +1,89 @@
 """
-Offline validation of the real-time rig BEFORE wiring CARLA.
+Record the CARLA scene ALONE (no 3D detection) as a smooth third-person
+driving video. Reuses bootstrap_client from realtime_detect.py so the scene
+matches (same random_seed=0, same map, same traffic). Runs fast because the
+heavy sensors + model are off.
 
-Takes real .pkl entries, runs each through the SAME pipeline + model + lidar2img
-that the live loop uses, and overlays predicted 3D boxes on the sample's own
-camera images. If boxes land on the right vehicles, then model, pipeline,
-lidar2img, and camera order are all proven correct — and anything that breaks
-later is purely a live-data-format issue.
+Run from the futr3d root with CARLA up:
+    python realtime/record_scene.py
 
-Run from the futr3d root:
-    python realtime/validate_offline.py
+NOTE ON ALIGNMENT: same seed reproduces the scene closely, but CARLA sync mode
+is not bit-perfect run-to-run, so this clean video may drift from the detection
+video over time. Good for side-by-side / picture-in-picture editing. For exact
+box-overlay onto clean footage, record clean + boxed in ONE run instead.
 """
 
-import os
-import sys
+import queue
 
+import carla
 import cv2
-import mmcv
 import numpy as np
-import torch
-from mmcv.parallel import collate
 
-# --- make project + realtime importable when run from futr3d root ------------
-sys.path.insert(0, os.path.abspath("."))
-sys.path.insert(0, os.path.abspath("realtime"))
+# reuse the IDENTICAL scene + helpers from the detection script
+from realtime_detect import bootstrap_client, parse_image, chase_transform
 
-# your working runtime builder (adjust module name if your file differs)
-from realtime_detect import build_runtime
-
-# your overlay function (adjust path to wherever visualize_results.py lives)
-try:
-    from tools.misc.visualize_results import project_boxes_to_image
-except ImportError:
-    sys.path.insert(0, os.path.abspath("tools"))
-    from visualize_results import project_boxes_to_image
-
-from mmdet3d.core.bbox import get_box_type
-
-def add_pipeline_fields(input_dict, box_type_3d="LiDAR"):
-    """Replicate Custom3DDataset.pre_pipeline so the test-time transforms
-    (GlobalRotScaleTrans, RandomFlip3D, DefaultFormatBundle3D) find their keys."""
-    box_type, box_mode = get_box_type(box_type_3d)
-    input_dict["box_type_3d"] = box_type
-    input_dict["box_mode_3d"] = box_mode
-    for k in ("img_fields", "bbox3d_fields", "pts_mask_fields",
-              "pts_seg_fields", "bbox_fields", "mask_fields", "seg_fields"):
-        input_dict[k] = []
-    return input_dict
-# =============================================================================
-# CONFIG — point these at your files
-# =============================================================================
-CONFIG     = "plugin/futr3d/configs/lidar_cam/lidar_0075v_cam_vov.py"
-CHECKPOINT = "work_dirs/lidar_0075v_cam_vov/epoch_12.pth"
-PKL        = "data/nuscenes/rgb2/nuscenes_infos_val.pkl"   # use the VAL pkl
-SAMPLE_IDS = [0, 1, 2, 3, 4]      # which samples to render
-SCORE_THR  = 0.2                  # lower this if you see nothing
-OUT_DIR    = "realtime/validation_out"
-
-
-# =============================================================================
-# Build an input_dict from a REAL pkl entry (its own paths + own calibration)
-# =============================================================================
-def infer_from_info(rt, info):
-    cam_order = list(info["cams"].keys())
-    image_paths, lidar2img = [], []
-    for cam in cam_order:
-        ci = info["cams"][cam]
-        image_paths.append(ci["data_path"])
-        # exact lidar2img formula from your visualize_results.py
-        l2c_r = np.linalg.inv(ci["sensor2lidar_rotation"])
-        l2c_t = ci["sensor2lidar_translation"] @ l2c_r.T
-        l2c_rt = np.eye(4)
-        l2c_rt[:3, :3] = l2c_r.T
-        l2c_rt[3, :3] = -l2c_t
-        viewpad = np.eye(4)
-        viewpad[:3, :3] = ci["cam_intrinsic"]
-        lidar2img.append(viewpad @ l2c_rt.T)
-
-    input_dict = dict(
-        sample_idx=info["token"],
-        pts_filename=info["lidar_path"],
-        sweeps=info.get("sweeps", []),
-        timestamp=info["timestamp"] / 1e6,
-        img_filename=image_paths,
-        lidar2img=lidar2img,
-    )
-    add_pipeline_fields(input_dict, rt["cfg"].data.test.get("box_type_3d", "LiDAR"))
-
-    data = rt["pipeline"](input_dict)
-    data = collate([data], samples_per_gpu=1)
-    with torch.no_grad():
-        result = rt["model"](return_loss=False, rescale=True, **data)
-    res = result[0].get("pts_bbox", result[0])
-    return (res["boxes_3d"], res["scores_3d"], res["labels_3d"],
-            lidar2img, image_paths, cam_order)
-
-
-def tile_2x3(imgs, h=320):
-    resized = [cv2.resize(im, (int(im.shape[1] * h / im.shape[0]), h)) for im in imgs]
-    w = max(im.shape[1] for im in resized)
-    padded = [np.pad(im, ((0, 0), (0, w - im.shape[1]), (0, 0))) for im in resized]
-    while len(padded) < 6:
-        padded.append(np.zeros_like(padded[0]))
-    return np.concatenate([np.concatenate(padded[0:3], axis=1),
-                           np.concatenate(padded[3:6], axis=1)], axis=0)
+# --- config ------------------------------------------------------------------
+SECONDS  = 30                     # sim-seconds to record
+SIM_FPS  = int(round(1 / 0.083333))   # 12 -> real-time-paced playback
+OUT      = "scene_drive.mp4"
+CHASE_W, CHASE_H, CHASE_FOV = 1280, 720, 90
 
 
 def main():
-    rt = build_runtime(CONFIG, CHECKPOINT, PKL)
-    class_names = list(rt["classes"])
-    data_infos = mmcv.load(PKL)
-    data_infos = data_infos["infos"] if isinstance(data_infos, dict) else data_infos
-    os.makedirs(OUT_DIR, exist_ok=True)
+    client = bootstrap_client()                  # same scene as the detection run
+    world = client.world
+    ego = client.ego_vehicle.get_actor()
+    spectator = world.get_spectator()
 
-    for i in SAMPLE_IDS:
-        info = data_infos[i]
-        boxes, scores, labels, lidar2img, image_paths, cam_order = infer_from_info(rt, info)
-        n_kept = int((scores >= SCORE_THR).sum())
-        print(f"sample {i}: {len(scores)} raw dets, {n_kept} above thr={SCORE_THR}")
+    # turn off the model's heavy sensors — we only need a chase view here
+    for s in client.sensors:
+        a = s.get_actor()
+        if a is not None:
+            try:
+                a.stop()
+            except RuntimeError:
+                pass
 
-        tiles = []
-        for j, cam in enumerate(cam_order):
-            img = cv2.imread(image_paths[j])
-            if img is None:
-                print(f"  !! could not read {image_paths[j]}")
-                continue
-            vis = project_boxes_to_image(boxes, scores, labels, lidar2img[j],
-                                         img, class_names, score_thr=SCORE_THR)
-            cv2.putText(vis, cam, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (255, 255, 255), 2, cv2.LINE_AA)
-            tiles.append(vis)
+    # dedicated chase camera, attached to the ego (rides with it automatically)
+    bp = world.get_blueprint_library().find("sensor.camera.rgb")
+    bp.set_attribute("image_size_x", str(CHASE_W))
+    bp.set_attribute("image_size_y", str(CHASE_H))
+    bp.set_attribute("fov", str(CHASE_FOV))
+    chase_tf = carla.Transform(carla.Location(x=-6.0, z=3.0),
+                               carla.Rotation(pitch=-15.0))   # behind + above, ego-local
+    chase = world.spawn_actor(bp, chase_tf, attach_to=ego)
+    q = queue.Queue()
+    chase.listen(q.put)
 
-        if tiles:
-            out = os.path.join(OUT_DIR, f"sample_{i:03d}_pred.png")
-            cv2.imwrite(out, tile_2x3(tiles))
-            print(f"  saved {out}")
+    writer = None
+    n_ticks = int(SECONDS / 0.083333)
+    try:
+        for i in range(n_ticks):
+            frame = world.tick()
+            spectator.set_transform(chase_transform(ego.get_transform()))  # live preview
+            while True:                                  # frame-matched grab
+                img = q.get(timeout=10.0)
+                if img.frame == frame:
+                    break
+            bgr = parse_image(img)[:, :, :3]
+            if writer is None:
+                h, w = bgr.shape[:2]
+                writer = cv2.VideoWriter(OUT, cv2.VideoWriter_fourcc(*"mp4v"),
+                                         SIM_FPS, (w, h))
+            writer.write(bgr)
+            if i % SIM_FPS == 0:
+                print(f"recorded {i}/{n_ticks} frames")
+    finally:
+        if writer is not None:
+            writer.release()
+        try:
+            chase.stop()
+            chase.destroy()
+        except RuntimeError:
+            pass
+        client.destroy_scene()
+        client.destroy_world()
+        print(f"saved {OUT}")
 
 
 if __name__ == "__main__":

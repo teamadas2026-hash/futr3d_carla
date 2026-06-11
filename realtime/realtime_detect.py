@@ -44,7 +44,7 @@ CARLA_PORT = 2000
 CARLA_PKG_DIR  = "/mnt/d/teamcarla/futr3d/carla_nuscenes"   # the OUTER folder
 CARLA_PKG_NAME = "carla_nuscenes"                            # the inner package with __init__.py
 CALIB_YAML = os.path.join(CARLA_PKG_DIR, "configs", "calibrated_sensors_rgb.yaml")
-MAP_NAME       = "Town10HD_Opt"
+MAP_NAME       = "Town10HD_opt"                 # the CARLA map you want to run on; should match your calib yaml
 
 DEVICE     = "cuda:0"
 SCORE_THR  = 0.3
@@ -77,6 +77,15 @@ def chase_transform(ego_tf, distance=8.0, height=5.0, pitch=-15.0):
                                            y=-distance * math.sin(yaw),
                                            z=height)
     return carla.Transform(loc, carla.Rotation(pitch=pitch, yaw=ego_tf.rotation.yaw))
+
+# =============================================================================
+#record helper
+def build_grid(tiles, h=300):
+    rs = [cv2.resize(t, (int(t.shape[1] * h / t.shape[0]), h)) for t in tiles]
+    w = max(t.shape[1] for t in rs)
+    pad = [np.pad(t, ((0, 0), (0, w - t.shape[1]), (0, 0))) for t in rs]
+    return np.concatenate([np.concatenate(pad[0:3], axis=1),
+                           np.concatenate(pad[3:6], axis=1)], axis=0)
 # =============================================================================
 # 1) ONE-TIME SETUP
 # =============================================================================
@@ -312,10 +321,10 @@ def run_loop(rt, client):
     import traceback
     world = client.world
     ego_actor = client.ego_vehicle.get_actor()
+    spectator = world.get_spectator()
     by_name = {s.name: s for s in client.sensors}
     cam_actors = [by_name[c].get_actor() for c in rt["cam_order"]]
     lidar_actor = by_name["LIDAR_TOP"].get_actor()
-    spectator = world.get_spectator()
 
     keep = {a.id for a in cam_actors} | {lidar_actor.id}
     for s in client.sensors:
@@ -328,6 +337,8 @@ def run_loop(rt, client):
 
     sync = SyncCapture(cam_actors, lidar_actor)
     sweep_buf = SweepBuffer(rt["template"], max_sweeps=9)
+    writer = None
+    SIM_FPS = int(round(1 / 0.083333))      # 12
     tick = 0
     try:
         while True:
@@ -339,16 +350,28 @@ def run_loop(rt, client):
             spectator.set_transform(chase_transform(ego_tf))   # follow the ego
             ts = lidar_raw.timestamp
             tick += 1
+
             if tick % INFER_EVERY == 0:
                 boxes, scores, labels = infer_core(rt, images_bgra, pts, ego_tf, ts, sweep_buf)
                 print(f"tick {tick}: {len(scores)} detections")
-                show_grid(draw_overlays(rt, boxes, scores, labels, images_bgra))
-                if cv2.waitKey(1) == 27:
+
+                grid = build_grid(draw_overlays(rt, boxes, scores, labels, images_bgra))
+                if writer is None:
+                    fh, fw = grid.shape[:2]
+                    writer = cv2.VideoWriter("realtime_detections.mp4",
+                                             cv2.VideoWriter_fourcc(*"mp4v"),
+                                             SIM_FPS, (fw, fh))
+                writer.write(grid)
+                cv2.imshow("FUTR3D realtime", grid)
+                if cv2.waitKey(1) == 27:        # Esc to quit
                     break
+
             sweep_buf.push(pts, ego_tf, ts)
     except Exception:
         traceback.print_exc()
     finally:
+        if writer is not None:
+            writer.release()
         for fn in (client.destroy_scene, client.destroy_world):
             try:
                 fn()
