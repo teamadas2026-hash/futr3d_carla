@@ -1,657 +1,363 @@
 """
-futr3d_carla.py
----------------
-All-in-one CARLA + FUTR3D real-time inference script.
+Real-time FUTR3D (LiDAR + 6 cam) inference on live CARLA frames.
 
-Data pipeline exactly mirrors the training collection pipeline:
-  - LiDAR: parse_lidar_data() from sensor.py
-      → (N,5) float32: [x, -y, z, intensity*255, channel]
-  - Camera: parse_image() from sensor.py
-      → (H,W,4) BGRA uint8, then drop alpha → (H,W,3) BGR
-  - Calibration: get_nuscenes_rt() from utils.py
-      → cameras use mode="zxy", LiDAR uses mode=None
+Bridge: feed a synthetic, pkl-shaped data_info (constant calibration from a real
+.pkl entry, dynamic file paths swapped per frame) through the FULL test pipeline,
+so it is the same code path as test.py. Multi-sweep accumulation (sweeps_num=9)
+is reproduced live with mmdet3d's obtain_sensor2top math.
 
-Usage:
-    python realtime/futr3d_carla.py \
-        --config    plugin/futr3d/configs/lidar_cam/lidar_0075v_cam_vov.py \
-        --ckpt      work_dirs/lidar_0075v_cam_vov/epoch_12.pth \
-        --sensors   realtime/calibrated_sensors_rgb.yaml \
-        --host      172.21.192.1 \
-        --port      2000 \
-        --threshold 0.3
+Spawning reuses your own Client, so live sensor settings are identical to training.
+
+EDIT THE CONFIG BLOCK BELOW. Run from the futr3d root with CARLA already running:
+    python realtime/realtime_detect.py
 """
 
-import argparse
-import time
-import threading
+import importlib
+import os
 import queue
-import random
-from collections import Counter
+import sys
 
-import carla
+import cv2
+import mmcv
 import numpy as np
-import yaml
 import torch
+import yaml
+from mmcv import Config
+from mmcv.parallel import MMDataParallel, collate
+from mmcv.runner import load_checkpoint
+from mmdet3d.core.bbox import get_box_type
+from mmdet3d.datasets.pipelines import Compose
+from mmdet3d.models import build_model
 from pyquaternion import Quaternion
 
-from mmcv import Config
-from mmdet3d.models import build_model
-from mmcv.runner import load_checkpoint
-from mmdet3d.datasets.pipelines import Compose
-from mmcv.parallel import collate, scatter
+# =============================================================================
+# CONFIG  —  the only environment-specific edits
+# =============================================================================
+CONFIG     = "plugin/futr3d/configs/lidar_cam/lidar_0075v_cam_vov.py"
+CHECKPOINT = "work_dirs/lidar_0075v_cam_vov/epoch_12.pth"
+PKL        = "./data/nuscenes/rgb2/nuscenes_infos_train.pkl"   # any existing info pkl
+
+CARLA_HOST = "172.21.192.1"        # from your config_rgb.yaml client block
+CARLA_PORT = 2000
+
+# your CARLA data-generation package (the one holding client.py / sensor.py / utils.py)
+CARLA_PKG_DIR  = "/mnt/d/teamcarla/futr3d/carla_nuscenes"   # the OUTER folder
+CARLA_PKG_NAME = "carla_nuscenes"                            # the inner package with __init__.py
+CALIB_YAML = os.path.join(CARLA_PKG_DIR, "configs", "calibrated_sensors_rgb.yaml")
+MAP_NAME       = "Town10HD_Opt"
+
+DEVICE     = "cuda:0"
+SCORE_THR  = 0.3
+INFER_EVERY = 1                   # sync mode pauses the sim while we infer, so 1 is fine
+TMP = "/tmp/carla_rt"
+os.makedirs(TMP, exist_ok=True)
+
+# --- reuse YOUR OWN code so live inputs are format-identical to training -----
+sys.path.insert(0, CARLA_PKG_DIR)
+_sensor = importlib.import_module(f"{CARLA_PKG_NAME}.sensor")
+_utils = importlib.import_module(f"{CARLA_PKG_NAME}.utils")
+Client = importlib.import_module(f"{CARLA_PKG_NAME}.client").Client
+parse_image = _sensor.parse_image
+parse_lidar_data = _sensor.parse_lidar_data
+get_nuscenes_rt = _utils.get_nuscenes_rt
+
+import carla  # noqa: E402  (carla is on path once the package imports it)
+
+# your overlay function (same import that worked in validate_offline.py)
+try:
+    from tools.misc.visualize_results import project_boxes_to_image
+except ImportError:
+    sys.path.insert(0, os.path.abspath("tools"))
+    from visualize_results import project_boxes_to_image
+
+def chase_transform(ego_tf, distance=8.0, height=5.0, pitch=-15.0):
+    import math
+    yaw = math.radians(ego_tf.rotation.yaw)
+    loc = ego_tf.location + carla.Location(x=-distance * math.cos(yaw),
+                                           y=-distance * math.sin(yaw),
+                                           z=height)
+    return carla.Transform(loc, carla.Rotation(pitch=pitch, yaw=ego_tf.rotation.yaw))
+# =============================================================================
+# 1) ONE-TIME SETUP
+# =============================================================================
+def add_pipeline_fields(input_dict, box_type_3d="LiDAR"):
+    """Replicate Custom3DDataset.pre_pipeline so test-time transforms find keys."""
+    box_type, box_mode = get_box_type(box_type_3d)
+    input_dict["box_type_3d"] = box_type
+    input_dict["box_mode_3d"] = box_mode
+    for k in ("img_fields", "bbox3d_fields", "pts_mask_fields",
+              "pts_seg_fields", "bbox_fields", "mask_fields", "seg_fields"):
+        input_dict[k] = []
+    return input_dict
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  Data parsers — exact copies of sensor.py
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_image(image):
-    """Exact copy of sensor.py parse_image() → (H,W,4) BGRA uint8."""
-    array = np.ndarray(
-        shape=(image.height, image.width, 4),
-        dtype=np.uint8, buffer=image.raw_data, order="C")
-    return array
-
-
-def parse_lidar_data(lidar_data):
-    """
-    Exact copy of sensor.py parse_lidar_data().
-    Returns (N, 5) float32: [x, -y, z, intensity*255, channel_idx]
-    This is the exact format the model was trained on.
-    """
-    pts = np.frombuffer(lidar_data.raw_data, dtype=np.float32).reshape(-1, 4)
-    pts = pts[np.isfinite(pts).all(axis=1)].copy()
-
-    # CARLA left-handed → nuScenes right-handed
-    pts[:, 1] = -pts[:, 1]
-
-    # Scale intensity 0-1 → 0-255
-    pts[:, 3] = np.clip(pts[:, 3] * 255.0, 0, 255)
-
-    # Channel index column
-    channels = np.zeros(len(pts), dtype=np.float32)
-    idx = 0
-    for ch in range(lidar_data.channels):
-        count = lidar_data.get_point_count(ch)
-        channels[idx:idx + count] = ch
-        idx += count
-
-    return np.column_stack([pts, channels]).astype(np.float32)  # (N, 5)
+def load_plugin(cfg):
+    """Import the FUTR3D plugin so its detector registers."""
+    if not getattr(cfg, "plugin", False):
+        return
+    sys.path.insert(0, os.path.abspath("."))
+    plugin_path = cfg.plugin if isinstance(cfg.plugin, str) else getattr(cfg, "plugin_dir", "")
+    module_path = plugin_path.strip("/").replace("/", ".")
+    importlib.import_module(module_path)
+    print("Imported plugin:", module_path)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  Coordinate helpers — exact copies of utils.py
-# ─────────────────────────────────────────────────────────────────────────────
+def build_runtime(config_path, checkpoint_path, pkl_path, device=DEVICE):
+    cfg = Config.fromfile(config_path)
+    load_plugin(cfg)
 
-def get_intrinsic(fov, image_size_x, image_size_y):
-    """Exact copy of utils.py get_intrinsic()."""
-    focal = float(image_size_x) / (2.0 * np.tan(float(fov) * np.pi / 360.0))
-    K = np.identity(3)
-    K[0, 0] = K[1, 1] = focal
-    K[0, 2] = float(image_size_x) / 2.0
-    K[1, 2] = float(image_size_y) / 2.0
-    return K
+    cfg.model.pretrained = None
+    cfg.model.train_cfg = None
+    cfg.data.test.test_mode = True
 
+    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
+    ckpt = load_checkpoint(model, checkpoint_path, map_location="cpu")
+    classes = ckpt.get("meta", {}).get("CLASSES", None) or cfg.get("class_names")
+    model.CLASSES = classes
+    model = MMDataParallel(model.to(device), device_ids=[int(device.split(":")[-1])])
+    model.eval()
 
-def get_nuscenes_rt(transform, mode=None):
-    """Exact copy of utils.py get_nuscenes_rt()."""
-    translation = [
-        transform.location.x,
-        -transform.location.y,
-        transform.location.z,
-    ]
-    if mode == "zxy":
-        R1 = np.array([[0,0,1],[1,0,0],[0,1,0]]) @ \
-             np.array([[1,0,0],[0,-1,0],[0,0,1]])
-    else:
-        R1 = np.array([[1,0,0],[0,-1,0],[0,0,1]])
+    pipeline = Compose(cfg.data.test.pipeline)   # FULL pipeline, loaders included
 
-    R2 = np.array(transform.get_matrix())[:3, :3]
-    R3 = np.array([[1,0,0],[0,-1,0],[0,0,1]])
-    rotation_matrix = R3 @ R2 @ R1
-    quat = Quaternion(matrix=rotation_matrix, rtol=1, atol=1).elements.tolist()
-    return quat, translation
+    infos = mmcv.load(pkl_path)
+    data_infos = infos["infos"] if isinstance(infos, dict) else infos
+    template = data_infos[0]
+    cam_order = list(template["cams"].keys())
+    print("Camera order (feed images in THIS order):", cam_order)
 
+    lidar2img = []
+    for cam_type in cam_order:
+        ci = template["cams"][cam_type]
+        l2c_r = np.linalg.inv(ci["sensor2lidar_rotation"])
+        l2c_t = ci["sensor2lidar_translation"] @ l2c_r.T
+        l2c_rt = np.eye(4)
+        l2c_rt[:3, :3] = l2c_r.T
+        l2c_rt[3, :3] = -l2c_t
+        intr = ci["cam_intrinsic"]
+        viewpad = np.eye(4)
+        viewpad[: intr.shape[0], : intr.shape[1]] = intr
+        lidar2img.append(viewpad @ l2c_rt.T)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  Calibration matrix builders
-#     Mirrors nuscenes_converter.py _fill_trainval_infos() exactly
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_lidar2img(cam_actor, lidar_actor):
-    """
-    Exact same computation as nuscenes_converter.py at training time.
-    Uses the world transforms of attached sensor actors.
-    """
-    cam_quat, cam_tr = get_nuscenes_rt(cam_actor.get_transform(), mode="zxy")
-    lid_quat, lid_tr = get_nuscenes_rt(lidar_actor.get_transform(), mode=None)
-
-    l2e_r_mat = Quaternion(lid_quat).rotation_matrix
-    l2e_t     = np.array(lid_tr)
-    e2g_r_mat = np.eye(3)
-    e2g_t     = np.zeros(3)
-    c2e_r_mat = Quaternion(cam_quat).rotation_matrix
-    c2e_t     = np.array(cam_tr)
-
-    # obtain_sensor2top from nuscenes_converter.py
-    R = (c2e_r_mat.T @ e2g_r_mat.T) @ (
-        np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T)
-    T = (c2e_t @ e2g_r_mat.T + e2g_t) @ (
-        np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T)
-    T -= (e2g_t @ (np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T)
-          + l2e_t @ np.linalg.inv(l2e_r_mat).T)
-
-    s2l_rot = R.T
-    s2l_tr  = T
-
-    lidar2cam_r  = np.linalg.inv(s2l_rot)
-    lidar2cam_t  = s2l_tr @ lidar2cam_r.T
-    lidar2cam_rt = np.eye(4, dtype=np.float64)
-    lidar2cam_rt[:3, :3] = lidar2cam_r.T
-    lidar2cam_rt[ 3, :3] = -lidar2cam_t
-
-    fov = float(cam_actor.attributes["fov"])
-    w   = float(cam_actor.attributes["image_size_x"])
-    h   = float(cam_actor.attributes["image_size_y"])
-    K33 = get_intrinsic(fov, w, h)
-    viewpad = np.eye(4, dtype=np.float64)
-    viewpad[:3, :3] = K33
-
-    return (viewpad @ lidar2cam_rt.T).astype(np.float32)
+    return dict(model=model, cfg=cfg, pipeline=pipeline, template=template,
+                cam_order=cam_order, lidar2img=lidar2img, classes=classes)
 
 
-def build_camera2lidar(cam_actor, lidar_actor):
-    """sensor2lidar_rotation/translation packed into 4x4."""
-    cam_quat, cam_tr = get_nuscenes_rt(cam_actor.get_transform(), mode="zxy")
-    lid_quat, lid_tr = get_nuscenes_rt(lidar_actor.get_transform(), mode=None)
-
-    l2e_r_mat = Quaternion(lid_quat).rotation_matrix
-    l2e_t     = np.array(lid_tr)
-    e2g_r_mat = np.eye(3)
-    e2g_t     = np.zeros(3)
-    c2e_r_mat = Quaternion(cam_quat).rotation_matrix
-    c2e_t     = np.array(cam_tr)
-
-    R = (c2e_r_mat.T @ e2g_r_mat.T) @ (
-        np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T)
-    T = (c2e_t @ e2g_r_mat.T + e2g_t) @ (
-        np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T)
-    T -= (e2g_t @ (np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T)
-          + l2e_t @ np.linalg.inv(l2e_r_mat).T)
-
-    cam2lidar = np.eye(4, dtype=np.float32)
-    cam2lidar[:3, :3] = R.T
-    cam2lidar[:3,  3] = T
-    return cam2lidar
+# =============================================================================
+# 2) MULTI-SWEEP ACCUMULATION (reproduces mmdet3d obtain_sensor2top)
+# =============================================================================
+def _ego_pose_nuscenes(ego_transform):
+    quat, trans = get_nuscenes_rt(ego_transform)           # your util, unchanged
+    return np.array(trans, dtype=np.float64), Quaternion(quat).rotation_matrix
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  Sensor buffer — time-window, LiDAR-triggered
-#     Does NOT require all sensors to share the same frame ID.
-#     Robust to TCP jitter between WSL and Windows CARLA.
-# ─────────────────────────────────────────────────────────────────────────────
+def _sensor2lidar(l2e_t, l2e_r, e2g_t, e2g_r, l2e_t_s, l2e_r_s, e2g_t_s, e2g_r_s):
+    inv = np.linalg.inv
+    R = (l2e_r_s.T @ e2g_r_s.T) @ (inv(e2g_r).T @ inv(l2e_r).T)
+    T = (l2e_t_s @ e2g_r_s.T + e2g_t_s) @ (inv(e2g_r).T @ inv(l2e_r).T)
+    T -= e2g_t @ (inv(e2g_r).T @ inv(l2e_r).T) + l2e_t @ inv(l2e_r).T
+    return R.T, T
 
-CAM_ORDER = [
-    "CAM_FRONT", "CAM_FRONT_RIGHT", "CAM_FRONT_LEFT",
-    "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
-]
 
-class SensorBuffer:
-    """
-    Keeps the latest data from each sensor.
-    Emits a complete bundle every time LiDAR fires,
-    as long as every camera has contributed at least once.
-    """
-    def __init__(self, cam_names):
-        self.cam_names = cam_names
-        self._lock     = threading.Lock()
-        self._latest   = {}
-        self.ready_q   = queue.Queue(maxsize=2)
+class SweepBuffer:
+    def __init__(self, template, max_sweeps=9, tmp_dir=os.path.join(TMP, "sweeps")):
+        os.makedirs(tmp_dir, exist_ok=True)
+        self.tmp_dir = tmp_dir
+        self.max_sweeps = max_sweeps
+        self.l2e_t = np.array(template["lidar2ego_translation"], dtype=np.float64)
+        self.l2e_r = Quaternion(template["lidar2ego_rotation"]).rotation_matrix
+        self.buf = []
+        self._n = 0
 
-    def on_lidar(self, data):
-        with self._lock:
-            self._latest["lidar"] = data
-            self._try_emit()
+    def build_sweeps(self, key_ego_transform):
+        e2g_t, e2g_r = _ego_pose_nuscenes(key_ego_transform)
+        sweeps = []
+        for e in reversed(self.buf):                       # newest previous first
+            R, T = _sensor2lidar(self.l2e_t, self.l2e_r, e2g_t, e2g_r,
+                                 self.l2e_t, self.l2e_r, e["e2g_t"], e["e2g_r"])
+            sweeps.append(dict(data_path=e["path"], timestamp=e["ts_us"],
+                               sensor2lidar_rotation=R, sensor2lidar_translation=T))
+        return sweeps
 
-    def on_camera(self, name, data):
-        with self._lock:
-            self._latest[name] = data
+    def push(self, points_n5, ego_transform, ts_seconds):
+        path = os.path.join(self.tmp_dir, f"sweep_{self._n % self.max_sweeps}.bin")
+        points_n5.astype(np.float32).tofile(path)
+        e2g_t, e2g_r = _ego_pose_nuscenes(ego_transform)
+        self.buf.append(dict(path=path, e2g_t=e2g_t, e2g_r=e2g_r,
+                             ts_us=int(ts_seconds * 1e6)))
+        if len(self.buf) > self.max_sweeps:
+            self.buf.pop(0)
+        self._n += 1
 
-    def _try_emit(self):
-        needed = set(self.cam_names) | {"lidar"}
-        if needed.issubset(self._latest.keys()):
-            bundle = dict(self._latest)
+
+# =============================================================================
+# 3) PER-FRAME INFERENCE
+# =============================================================================
+def _write_frame(rt, images_bgra, pts):
+    lidar_path = os.path.join(TMP, "lidar.bin")
+    pts.astype(np.float32).tofile(lidar_path)
+    cam_paths = {}
+    for cam in rt["cam_order"]:
+        cv2.imwrite(os.path.join(TMP, f"{cam}.png"), images_bgra[cam][:, :, :3])
+        cam_paths[cam] = os.path.join(TMP, f"{cam}.png")
+    return lidar_path, cam_paths
+
+
+def make_input_dict(rt, lidar_path, cam_paths, sweeps, ts_seconds):
+    input_dict = dict(
+        sample_idx=rt["template"]["token"],
+        pts_filename=lidar_path,
+        sweeps=sweeps,
+        timestamp=ts_seconds,
+        img_filename=[cam_paths[c] for c in rt["cam_order"]],
+        lidar2img=[m.copy() for m in rt["lidar2img"]],
+    )
+    add_pipeline_fields(input_dict, rt["cfg"].data.test.get("box_type_3d", "LiDAR"))
+    return input_dict
+
+
+@torch.no_grad()
+def infer_core(rt, images_bgra, pts, ego_tf, ts, sweep_buf, score_thr=SCORE_THR):
+    lidar_path, cam_paths = _write_frame(rt, images_bgra, pts)
+    sweeps = sweep_buf.build_sweeps(ego_tf)                 # previous clouds
+    data = rt["pipeline"](make_input_dict(rt, lidar_path, cam_paths, sweeps, ts))
+    data = collate([data], samples_per_gpu=1)
+    result = rt["model"](return_loss=False, rescale=True, **data)
+    res = result[0].get("pts_bbox", result[0])
+    keep = res["scores_3d"] >= score_thr
+    return res["boxes_3d"][keep], res["scores_3d"][keep], res["labels_3d"][keep]
+
+
+# =============================================================================
+# 4) VISUALIZATION
+# =============================================================================
+def draw_overlays(rt, boxes, scores, labels, images_bgra):
+    tiles = []
+    for i, cam in enumerate(rt["cam_order"]):
+        bgr = images_bgra[cam][:, :, :3].copy()
+        vis = project_boxes_to_image(boxes, scores, labels, rt["lidar2img"][i],
+                                     bgr, list(rt["classes"]), score_thr=0.0)
+        cv2.putText(vis, cam, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        tiles.append(vis)
+    return tiles
+
+
+def show_grid(tiles, h=300):
+    rs = [cv2.resize(t, (int(t.shape[1] * h / t.shape[0]), h)) for t in tiles]
+    w = max(t.shape[1] for t in rs)
+    pad = [np.pad(t, ((0, 0), (0, w - t.shape[1]), (0, 0))) for t in rs]
+    grid = np.concatenate([np.concatenate(pad[0:3], axis=1),
+                           np.concatenate(pad[3:6], axis=1)], axis=0)
+    cv2.imshow("FUTR3D realtime", grid)
+
+
+# =============================================================================
+# 5) FRAME-SYNCED CAPTURE
+# =============================================================================
+class SyncCapture:
+    """Re-listen the 6 cams + lidar onto queues; pull data matched by frame id."""
+    def __init__(self, cam_actors, lidar_actor):
+        self.cam_q = [queue.Queue() for _ in cam_actors]
+        self.lidar_q = queue.Queue()
+        for q, a in zip(self.cam_q, cam_actors):
+            self._relisten(a, q.put)
+        self._relisten(lidar_actor, self.lidar_q.put)
+
+    @staticmethod
+    def _relisten(actor, cb):
+        # Sensor.set_actor() already attached add_data; a second listen()
+        # without stop() crashes CARLA. Clear it first, then listen fresh.
+        try:
+            actor.stop()
+        except RuntimeError:
+            pass
+        actor.listen(cb)
+
+    def grab(self, frame, timeout=10.0):
+        def pop(q):
+            while True:
+                d = q.get(timeout=timeout)
+                if d.frame == frame:
+                    return d
+        return [pop(q) for q in self.cam_q], pop(self.lidar_q)
+
+
+# =============================================================================
+# 6) BOOTSTRAP via your Client + main loop
+# =============================================================================
+CLEAR_WEATHER = dict(cloudiness=0, precipitation=0, precipitation_deposits=0,
+                     wind_intensity=0, sun_azimuth_angle=0, sun_altitude_angle=90,
+                     fog_density=0, fog_distance=0, wetness=0, fog_falloff=0,
+                     scattering_intensity=0, mie_scattering_scale=0,
+                     rayleigh_scattering_scale=0.0331, dust_storm=0)
+
+
+def bootstrap_client():
+    client = Client({"host": CARLA_HOST, "port": CARLA_PORT, "time_out": 6000.0}, random_seed=0)
+    client.generate_world({"map_name": MAP_NAME, "settings": {"fixed_delta_seconds": 0.083333}})
+    with open(CALIB_YAML) as f:
+        calib = yaml.safe_load(f)
+    scene_config = dict(
+        custom=True, weather_mode="custom", weather=CLEAR_WEATHER,
+        ego_vehicle=dict(bp_name="vehicle.tesla.model3", location=None,
+                         rotation={"yaw": 0, "pitch": 0, "roll": 0}, options=None),
+        traffic=dict(cars=30, trucks=6, bikes=6, vans=6, walkers=60),
+        calibrated_sensors=calib, ego_speed_diff=-20, description="realtime",
+    )
+    client.generate_scene(scene_config)
+    return client
+
+
+def run_loop(rt, client):
+    import traceback
+    world = client.world
+    ego_actor = client.ego_vehicle.get_actor()
+    by_name = {s.name: s for s in client.sensors}
+    cam_actors = [by_name[c].get_actor() for c in rt["cam_order"]]
+    lidar_actor = by_name["LIDAR_TOP"].get_actor()
+    spectator = world.get_spectator()
+
+    keep = {a.id for a in cam_actors} | {lidar_actor.id}
+    for s in client.sensors:
+        a = s.get_actor()
+        if a is not None and a.id not in keep:
             try:
-                self.ready_q.put_nowait(bundle)
-            except queue.Full:
-                pass   # inference slower than LiDAR rate — drop frame
+                a.stop()
+            except Exception:
+                pass
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5.  FUTR3D inference wrapper
-# ─────────────────────────────────────────────────────────────────────────────
-
-class FUTR3DInference:
-    def __init__(self, config_path, ckpt_path, score_threshold=0.3):
-        self.threshold = score_threshold
-        self.device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cfg            = Config.fromfile(config_path)
-        self.cfg       = cfg
-
-        # Register FUTR3D plugin
-        if hasattr(cfg, "plugin") and cfg.plugin:
-            import importlib, os as _os
-            _parts = (_os.path.dirname(cfg.plugin_dir)
-                      if hasattr(cfg, "plugin_dir")
-                      else _os.path.dirname(config_path)).split("/")
-            _mod = _parts[0]
-            for p in _parts[1:]:
-                _mod += "." + p
-            print(f"Loading plugin: {_mod}")
-            importlib.import_module(_mod)
-
-        self.model = build_model(cfg.model, train_cfg=None,
-                                 test_cfg=cfg.get("test_cfg"))
-        load_checkpoint(self.model, ckpt_path, map_location="cpu")
-        self.model.to(self.device).eval()
-
-        # Build pipeline — skip steps that read from disk or need GT
-        skip = {
-            "LoadMultiViewImageFromFiles",   # we inject images directly
-            "LoadPointsFromFile",            # we inject points directly
-            "LoadPointsFromMultiSweeps",     # no sweeps in real-time
-            "LoadAnnotations3D",
-            "ObjectRangeFilter",
-            "ObjectNameFilter",
-            "PointsRangeFilter",
-        }
-        self.pipeline    = Compose([s for s in cfg.test_pipeline
-                                    if s["type"] not in skip])
-        self.class_names = cfg.class_names
-
-        # Image normalisation params (from config) — applied manually
-        norm_cfg = None
-        for step in cfg.test_pipeline:
-            if step["type"] == "NormalizeMultiviewImage":
-                norm_cfg = step
-                break
-        self.norm_mean = np.array(norm_cfg["mean"], dtype=np.float32) if norm_cfg else np.array([103.530, 116.280, 123.675])
-        self.norm_std  = np.array(norm_cfg["std"],  dtype=np.float32) if norm_cfg else np.array([57.375,  57.120,  58.395])
-        self.to_rgb    = norm_cfg.get("to_rgb", False) if norm_cfg else False
-
-        print(f"Model ready  device={self.device}  threshold={score_threshold}")
-
-    def _normalize_images(self, images_bgr):
-        """
-        Manually apply NormalizeMultiviewImage.
-        Mirrors mmdet3d NormalizeMultiviewImage transform.
-        """
-        out = []
-        for img in images_bgr:
-            img = img.astype(np.float32)
-            if self.to_rgb:
-                img = img[:, :, ::-1].copy()   # BGR → RGB
-            img = (img - self.norm_mean) / self.norm_std
-            out.append(img)
-        return out
-
-    @torch.no_grad()
-    def infer(self, lidar_pts, images_bgr, lidar2img_list, cam2lidar_list):
-        """
-        lidar_pts    : (N,5) float32 — exact output of parse_lidar_data()
-        images_bgr   : list of (H,W,3) uint8 BGR — parse_image()[...,:3]
-
-        We skip LoadMultiViewImageFromFiles and LoadPointsFromFile
-        and inject the data directly, then run the rest of the pipeline
-        (PhotoMetricDistortion is skipped at test time, PadMultiViewImage
-        and DefaultFormatBundle3D still run).
-        """
-        # Normalise images manually (replaces NormalizeMultiviewImage)
-        images_norm = self._normalize_images(images_bgr)
-
-        data = dict(
-            # Points — injected directly as np.ndarray
-            points=lidar_pts,
-            # Images — already normalised, stored as list of float32 arrays
-            img=images_norm,
-            img_fields=["img"],
-            # Calibration
-            lidar2img=lidar2img_list,
-            camera2lidar=cam2lidar_list,
-            # Required empty fields
-            bbox3d_fields=[], pts_mask_fields=[], pts_seg_fields=[],
-            bbox_fields=[], mask_fields=[], seg_fields=[],
-            sweeps=[],
-            timestamp=time.time(),
-            # img_norm_cfg needed by some pipeline steps
-            img_norm_cfg=dict(mean=self.norm_mean.tolist(),
-                              std=self.norm_std.tolist(),
-                              to_rgb=self.to_rgb),
-        )
-        data    = self.pipeline(data)
-        data    = collate([data], samples_per_gpu=1)
-        data    = scatter(data, [self.device])[0]
-        results = self.model(return_loss=False, rescale=True, **data)
-
-        boxes  = results[0]["pts_bbox"]["boxes_3d"].tensor.cpu().numpy()
-        scores = results[0]["pts_bbox"]["scores_3d"].cpu().numpy()
-        labels = results[0]["pts_bbox"]["labels_3d"].cpu().numpy()
-        mask   = scores > self.threshold
-        return boxes[mask], scores[mask], labels[mask]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6.  CARLA debug draw
-# ─────────────────────────────────────────────────────────────────────────────
-
-CLASS_COLORS = {
-    "car":                  carla.Color(  0, 255,   0),
-    "truck":                carla.Color(255, 165,   0),
-    "bus":                  carla.Color(255, 140,   0),
-    "pedestrian":           carla.Color(255,   0,   0),
-    "motorcycle":           carla.Color(  0,   0, 255),
-    "bicycle":              carla.Color(  0, 200, 200),
-    "construction_vehicle": carla.Color(128,   0, 128),
-    "trailer":              carla.Color(200, 200,   0),
-    "barrier":              carla.Color(128, 128, 128),
-    "traffic_cone":         carla.Color(255, 165,   0),
-}
-
-def draw_boxes(world, boxes, labels, class_names, life_time=0.15):
-    for box, label in zip(boxes, labels):
-        cx, cy, cz, l, w, h, yaw = box[:7]
-        # nuScenes → CARLA (flip y back)
-        loc   = carla.Location(x=float(cx), y=float(-cy), z=float(cz))
-        ext   = carla.Vector3D(float(l/2), float(w/2), float(h/2))
-        rot   = carla.Rotation(yaw=float(np.degrees(-yaw)))
-        bbox  = carla.BoundingBox(loc, ext)
-        name  = class_names[int(label)] if int(label) < len(class_names) else "?"
-        color = CLASS_COLORS.get(name, carla.Color(255, 255, 255))
-        world.debug.draw_box(bbox, rot, thickness=0.08,
-                             color=color, life_time=life_time)
-        world.debug.draw_string(loc, name, color=color, life_time=life_time)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7.  Test scene helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-CAR_BLUEPRINTS   = ["vehicle.audi.a2", "vehicle.audi.tt",
-                    "vehicle.toyota.prius", "vehicle.nissan.micra",
-                    "vehicle.citroen.c3", "vehicle.seat.leon"]
-TRUCK_BLUEPRINTS = ["vehicle.carlamotors.carlacola", "vehicle.ford.ambulance",
-                    "vehicle.mercedes.sprinter", "vehicle.volkswagen.t2"]
-MOTO_BLUEPRINTS  = ["vehicle.kawasaki.ninja", "vehicle.yamaha.yzf",
-                    "vehicle.harley-davidson.low_rider", "vehicle.vespa.zx125"]
-
-def offset_tf(base_tf, dx, dy, dz=0.0):
-    return carla.Transform(
-        carla.Location(x=base_tf.location.x + dx,
-                       y=base_tf.location.y + dy,
-                       z=base_tf.location.z + dz),
-        carla.Rotation(yaw=base_tf.rotation.yaw))
-
-def try_spawn_vehicle(world, bp_lib, bp_names, transform, label):
-    for bp_name in bp_names:
-        matches = bp_lib.filter(bp_name)
-        if not matches:
-            continue
-        bp = matches[0]
-        for dz in [0.0, 0.3, 0.6, 1.0]:
-            actor = world.try_spawn_actor(bp, offset_tf(transform, 0, 0, dz))
-            if actor:
-                print(f"  [{label}] '{bp_name}'  id={actor.id}")
-                return actor
-    print(f"  [{label}] WARNING — all spawn attempts failed")
-    return None
-
-def try_spawn_pedestrian(world, bp_lib, transform):
-    bps = list(bp_lib.filter("walker.pedestrian.*"))
-    random.shuffle(bps)
-    for bp in bps:
-        for dz in [0.5, 1.0, 1.5]:
-            actor = world.try_spawn_actor(bp, offset_tf(transform, 0, 0, dz))
-            if actor:
-                print(f"  [pedestrian] '{bp.id}'  id={actor.id}")
-                return actor
-    print("  [pedestrian] WARNING — all spawn attempts failed")
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 8.  Main
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main(args):
-    client = carla.Client(args.host, args.port)
-    client.set_timeout(10.0)
-    world  = client.get_world()
-    print(f"Connected  map={world.get_map().name}\n")
-
-    all_actors = []
-
+    sync = SyncCapture(cam_actors, lidar_actor)
+    sweep_buf = SweepBuffer(rt["template"], max_sweeps=9)
+    tick = 0
     try:
-        # ── Strip map layers ──────────────────────────────────────────────────
-        print("Stripping map layers...")
-        for layer in [carla.MapLayer.Buildings, carla.MapLayer.Foliage,
-                      carla.MapLayer.ParkedVehicles, carla.MapLayer.Props,
-                      carla.MapLayer.StreetLights, carla.MapLayer.Decals]:
-            try:
-                world.unload_map_layer(layer)
-            except Exception:
-                pass
-        time.sleep(1.0)
-        print("Done.\n")
-
-        bp_lib    = world.get_blueprint_library()
-        spawn_pts = world.get_map().get_spawn_points()
-        if not spawn_pts:
-            raise RuntimeError("No spawn points.")
-        base_tf = spawn_pts[0]
-        r = args.radius
-
-        # ── Spawn ego ─────────────────────────────────────────────────────────
-        print("[ego] Spawning...")
-        ego_bp = bp_lib.find("vehicle.lincoln.mkz_2020")
-        ego_bp.set_attribute("color", "255,255,255")
-        ego = None
-        for dz in [0.0, 0.3, 0.6]:
-            ego = world.try_spawn_actor(ego_bp, offset_tf(base_tf, 0, 0, dz))
-            if ego:
-                break
-        if ego is None:
-            raise RuntimeError("Cannot spawn ego vehicle.")
-        ego.set_simulate_physics(False)
-        all_actors.append(ego)
-        print(f"  [ego] id={ego.id}  {base_tf.location}\n")
-        time.sleep(0.5)
-
-        # ── Spawn test actors ─────────────────────────────────────────────────
-        print("Spawning test actors...")
-        for label, bp_names, dx, dy in [
-            ("car",        CAR_BLUEPRINTS,   r,  r),
-            ("truck",      TRUCK_BLUEPRINTS,  r, -r),
-            ("motorcycle", MOTO_BLUEPRINTS,  -r,  r),
-        ]:
-            a = try_spawn_vehicle(world, bp_lib, bp_names,
-                                  offset_tf(base_tf, dx, dy), label)
-            if a:
-                a.set_simulate_physics(False)
-                all_actors.append(a)
-            time.sleep(0.3)
-
-        ped = try_spawn_pedestrian(world, bp_lib, offset_tf(base_tf, -r, -r))
-        if ped:
-            ped.set_simulate_physics(False)
-            all_actors.append(ped)
-        time.sleep(0.3)
-
-        print(f"\nTest scene: {len(all_actors)} actors total\n")
-
-        # ── Load sensor YAML ──────────────────────────────────────────────────
-        with open(args.sensors) as f:
-            sensor_cfg = yaml.safe_load(f)
-
-        sensor_list = [s for s in sensor_cfg["sensors"]
-                       if s["bp_name"] in ("sensor.camera.rgb",
-                                           "sensor.lidar.ray_cast")]
-        # LiDAR first
-        sensor_list.sort(key=lambda s: 0 if "lidar" in s["bp_name"] else 1)
-
-        cam_actors  = {}
-        lidar_actor = None
-        sensors     = []
-
-        # ── Attach sensors one at a time ──────────────────────────────────────
-        print("Attaching sensors...")
-        for s in sensor_list:
-            bp = bp_lib.find(s["bp_name"])
-            if bp is None:
-                print(f"  {s['name']} — not found, skipping")
-                continue
-
-            if "camera" in s["bp_name"]:
-                bp.set_attribute("image_size_x", str(args.cam_width))
-                bp.set_attribute("image_size_y", str(args.cam_height))
-                bp.set_attribute("sensor_tick",  str(args.sensor_tick))
-                # preserve FOV from YAML
-                opts = s.get("options") or {}
-                if "fov" in opts:
-                    bp.set_attribute("fov", str(opts["fov"]))
-
-            if "lidar" in s["bp_name"]:
-                bp.set_attribute("points_per_second", "560000")
-                bp.set_attribute("sensor_tick",       str(args.sensor_tick))
-                bp.set_attribute("channels",          "32")
-                bp.set_attribute("range",             "80")
-                bp.set_attribute("upper_fov",         "10")
-                bp.set_attribute("lower_fov",         "-30")
-                bp.set_attribute("dropoff_general_rate",   "0.2")
-                bp.set_attribute("dropoff_intensity_limit", "0.6")
-                bp.set_attribute("dropoff_zero_intensity",  "0.2")
-
-            tf = carla.Transform(carla.Location(**s["location"]),
-                                 carla.Rotation(**s["rotation"]))
-            print(f"  {s['name']}...", end=" ", flush=True)
-            actor = world.try_spawn_actor(bp, tf, attach_to=ego)
-            if actor is None:
-                print("FAILED")
-                continue
-            print(f"ok  id={actor.id}")
-            sensors.append(actor)
-            all_actors.append(actor)
-
-            if "camera" in s["bp_name"]:
-                cam_actors[s["name"]] = actor
-            elif "lidar" in s["bp_name"]:
-                lidar_actor = actor
-
-            time.sleep(args.spawn_delay)
-
-        if lidar_actor is None:
-            raise RuntimeError("LiDAR failed to attach.")
-        present_cams = [c for c in CAM_ORDER if c in cam_actors]
-        if not present_cams:
-            raise RuntimeError("No cameras attached.")
-
-        print(f"\nCameras : {present_cams}")
-        print(f"LiDAR   : id={lidar_actor.id}")
-        print(f"Res     : {args.cam_width}x{args.cam_height}  tick={args.sensor_tick}s\n")
-
-        # ── Calibration matrices ──────────────────────────────────────────────
-        lidar2img_list = [build_lidar2img(cam_actors[c], lidar_actor)
-                          for c in present_cams]
-        cam2lidar_list = [build_camera2lidar(cam_actors[c], lidar_actor)
-                          for c in present_cams]
-
-        # ── Start listening ───────────────────────────────────────────────────
-        buf = SensorBuffer(present_cams)
-        lidar_actor.listen(buf.on_lidar)
-        for name, actor in cam_actors.items():
-            actor.listen(lambda data, n=name: buf.on_camera(n, data))
-
-        # ── Load model ────────────────────────────────────────────────────────
-        print(f"Waiting {args.warmup}s for sensors to warm up...")
-        time.sleep(args.warmup)
-        print("\nLoading FUTR3D model...")
-        futr3d = FUTR3DInference(args.config, args.ckpt,
-                                 score_threshold=args.threshold)
-
-        # ── Inference loop ────────────────────────────────────────────────────
-        print("\nReal-time inference started — Ctrl+C to stop\n")
-        frame_count = 0
         while True:
-            try:
-                frame = buf.ready_q.get(timeout=2.0)
-            except queue.Empty:
-                print("Waiting for sensor frame...")
-                continue
-
-            t0 = time.time()
-
-            # ── Parse data using same functions as training pipeline ───────────
-            lidar_pts = parse_lidar_data(frame["lidar"])   # (N,5) float32
-            images    = [parse_image(frame[c])[:, :, :3]   # (H,W,3) BGR
-                         for c in present_cams]
-
-            try:
-                boxes, scores, labels = futr3d.infer(
-                    lidar_pts, images, lidar2img_list, cam2lidar_list)
-            except Exception as e:
-                print(f"Inference error: {e}")
-                import traceback; traceback.print_exc()
-                continue
-
-            draw_boxes(world, boxes, labels, futr3d.class_names,
-                       life_time=args.box_lifetime)
-
-            dt     = time.time() - t0
-            frame_count += 1
-            counts  = Counter(futr3d.class_names[int(l)] for l in labels)
-            det_str = "  ".join(f"{k}:{v}" for k, v in counts.items())
-            print(f"[{frame_count:04d}]  det={len(boxes):3d}  "
-                  f"lat={dt*1000:.0f}ms  {det_str if det_str else 'none'}")
-
-    except KeyboardInterrupt:
-        print("\nStopping...")
-    except Exception as e:
-        print(f"\nFatal: {e}")
-        import traceback; traceback.print_exc()
+            frame = world.tick()
+            cams_raw, lidar_raw = sync.grab(frame)
+            images_bgra = {rt["cam_order"][i]: parse_image(cams_raw[i]) for i in range(6)}
+            pts = parse_lidar_data(lidar_raw)
+            ego_tf = ego_actor.get_transform()
+            spectator.set_transform(chase_transform(ego_tf))   # follow the ego
+            ts = lidar_raw.timestamp
+            tick += 1
+            if tick % INFER_EVERY == 0:
+                boxes, scores, labels = infer_core(rt, images_bgra, pts, ego_tf, ts, sweep_buf)
+                print(f"tick {tick}: {len(scores)} detections")
+                show_grid(draw_overlays(rt, boxes, scores, labels, images_bgra))
+                if cv2.waitKey(1) == 27:
+                    break
+            sweep_buf.push(pts, ego_tf, ts)
+    except Exception:
+        traceback.print_exc()
     finally:
-        print("\nCleaning up...")
-        for a in reversed(all_actors):
+        for fn in (client.destroy_scene, client.destroy_world):
             try:
-                if hasattr(a, "stop"):
-                    a.stop()
-                a.destroy()
+                fn()
             except Exception:
                 pass
-        for layer in [carla.MapLayer.Buildings, carla.MapLayer.Foliage]:
-            try:
-                world.load_map_layer(layer)
-            except Exception:
-                pass
-        print("Done.")
+        cv2.destroyAllWindows()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 9.  Entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config",      required=True)
-    parser.add_argument("--ckpt",        required=True)
-    parser.add_argument("--sensors",     default="calibrated_sensors_rgb.yaml")
-    parser.add_argument("--host",        default="172.21.192.1")
-    parser.add_argument("--port",        default=2000,  type=int)
-    parser.add_argument("--threshold",   default=0.3,   type=float)
-    parser.add_argument("--radius",      default=4.0,   type=float)
-    parser.add_argument("--cam-width",   default=800,   type=int,   dest="cam_width")
-    parser.add_argument("--cam-height",  default=450,   type=int,   dest="cam_height")
-    parser.add_argument("--sensor-tick", default=0.2,   type=float, dest="sensor_tick")
-    parser.add_argument("--spawn-delay", default=1.5,   type=float, dest="spawn_delay")
-    parser.add_argument("--warmup",      default=4.0,   type=float)
-    parser.add_argument("--box-lifetime",default=0.15,  type=float, dest="box_lifetime")
-    args = parser.parse_args()
-    main(args)
+    rt = build_runtime(CONFIG, CHECKPOINT, PKL)
+    client = bootstrap_client()
+    run_loop(rt, client)
