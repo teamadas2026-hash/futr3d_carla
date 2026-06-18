@@ -377,13 +377,25 @@ def draw_overlays_with_tracks(rt, boxes, scores, labels, images_bgra, all_tracks
 
 
 
-def show_grid(tiles, h=300):
-    rs = [cv2.resize(t, (int(t.shape[1] * h / t.shape[0]), h)) for t in tiles]
-    w = max(t.shape[1] for t in rs)
-    pad = [np.pad(t, ((0, 0), (0, w - t.shape[1]), (0, 0))) for t in rs]
-    grid = np.concatenate([np.concatenate(pad[0:3], axis=1),
-                           np.concatenate(pad[3:6], axis=1)], axis=0)
-    cv2.imshow("FUTR3D realtime", grid)
+def save_tracking_history(track_history, ego_history, output_path="tracking_history.yaml"):
+    """Save track and ego history to YAML file."""
+    import yaml
+    data = {
+        "ego_history": ego_history,
+        "track_history": {
+            int(tid): {
+                "class": info["class"],
+                "states": info["states"]
+            } for tid, info in track_history.items()
+        }
+    }
+    with open(output_path, 'w') as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    print(f"\nSaved tracking history to {output_path}")
+    print(f"  Ego trajectory: {len(ego_history)} frames")
+    print(f"  Active tracks: {len(track_history)}")
+    for tid, info in track_history.items():
+        print(f"    ID {tid} ({info['class']}): {len(info['states'])} states")
 
 
 # =============================================================================
@@ -517,6 +529,15 @@ def run_loop(rt, client):
     writer = None
     SIM_FPS = int(round(1 / 0.083333))      # 12
     tick = 0
+    
+    # History tracking
+    track_history = {}  # {track_id: {"class": str, "states": [{"pos": [x,y], "vel": [vx,vy], "yaw": yaw, "time": ts}, ...]}}
+    ego_history = []    # [{"pos": [x,y], "vel": [vx,vy], "yaw": yaw, "time": ts}, ...]
+    HISTORY_LENGTH = 30  # Keep last N frames per track
+    DEAD_TRACK_THRESHOLD = 5  # Remove tracks not seen for N frames
+    
+    prev_ego_pos = None
+    prev_ego_time = None
     try:
         while True:
             frame = world.tick()
@@ -539,8 +560,31 @@ def run_loop(rt, client):
                 print(f"\n=== Tick {tick} ===")
                 print(f"Detections: {len(scores)}, Trackers: {list(trackers.keys())}")
                 
+                # Collect ego history
+                ego_pos = np.array([ego_tf.location.x, ego_tf.location.y])
+                ego_yaw = ego_tf.rotation.yaw
+                ego_vel = np.array([0.0, 0.0])
+                if prev_ego_pos is not None and prev_ego_time is not None:
+                    dt = ts - prev_ego_time
+                    if dt > 0:
+                        ego_vel = (ego_pos - prev_ego_pos) / dt
+                ego_history.append({
+                    "pos": ego_pos.tolist(),
+                    "vel": ego_vel.tolist(),
+                    "yaw": float(ego_yaw),
+                    "time": float(ts)
+                })
+                # Keep only recent history
+                if len(ego_history) > HISTORY_LENGTH:
+                    ego_history.pop(0)
+                prev_ego_pos = ego_pos
+                prev_ego_time = ts
+                
                 all_tracks = []
                 all_tracks_per_cat = {}  # Store tracks per category for visualization
+                
+                # Track which IDs were seen this frame (for dead track removal)
+                active_track_ids = set()
                 
                 for cat_idx, cat in enumerate(rt["classes"]):
                     if cat not in trackers:
@@ -552,16 +596,19 @@ def run_loop(rt, client):
                     if cat_mask.any():
                         cat_dets = []
                         cat_info = []
+                        cat_dets_idx = []  # Track indices for velocity lookup
                         for i in np.where(cat_mask)[0]:
                             x, y, z, w, l, h, yaw = boxes_np[i][:7]
                             score = scores_np[i]
                             cat_dets.append([h, w, l, x, y, z, yaw])
                             cat_info.append([score, 0, 0, 0, 0, 0, 0, 0])
+                            cat_dets_idx.append(i)
                         cat_dets = np.array(cat_dets)
                         cat_info = np.array(cat_info)
                     else:
                         cat_dets = np.empty((0, 7))
                         cat_info = np.empty((0, 8))
+                        cat_dets_idx = []
                     
                     print(f"  {cat}: {len(cat_dets)} dets", end="")
                     
@@ -579,11 +626,34 @@ def run_loop(rt, client):
                             tracked_boxes_list = []
                             track_ids_list = []
                             
-                            for t in tracks_output:
+                            for t_idx, t in enumerate(tracks_output):
                                 h, w, l, x, y, z, yaw, track_id = t[:8]
+                                track_id = int(track_id)
                                 tracked_boxes_list.append([h, w, l, x, y, z, yaw])
-                                track_ids_list.append(int(track_id))
+                                track_ids_list.append(track_id)
                                 all_tracks.append([h, w, l, x, y, z, yaw, track_id])
+                                
+                                # Get velocity from original FUTR3D detection
+                                vx, vy = 0.0, 0.0
+                                if len(cat_dets_idx) > 0 and t_idx < len(cat_dets_idx):
+                                    orig_idx = cat_dets_idx[t_idx]
+                                    vx, vy = boxes_np[orig_idx][7:9]
+                                
+                                # Update track history
+                                active_track_ids.add(track_id)
+                                if track_id not in track_history:
+                                    track_history[track_id] = {"class": cat, "states": []}
+                                
+                                track_history[track_id]["states"].append({
+                                    "pos": [float(x), float(y)],
+                                    "vel": [float(vx), float(vy)],
+                                    "yaw": float(yaw),
+                                    "time": float(ts)
+                                })
+                                
+                                # Keep only recent history
+                                if len(track_history[track_id]["states"]) > HISTORY_LENGTH:
+                                    track_history[track_id]["states"].pop(0)
                             
                             # Store for visualization
                             if len(tracked_boxes_list) > 0:
@@ -596,7 +666,22 @@ def run_loop(rt, client):
                     except Exception as e:
                         print(f" -> ERROR: {e}")
                 
-                print(f"Result: {len(all_tracks)} total tracks\n")
+                # Remove dead tracks (not seen for several frames)
+                dead_tracks = []
+                for track_id in list(track_history.keys()):
+                    if track_id not in active_track_ids:
+                        # Check if track is stale
+                        last_time = track_history[track_id]["states"][-1]["time"] if track_history[track_id]["states"] else 0
+                        if ts - last_time > DEAD_TRACK_THRESHOLD * (1.0 / SIM_FPS):
+                            dead_tracks.append(track_id)
+                
+                for track_id in dead_tracks:
+                    del track_history[track_id]
+                
+                if dead_tracks:
+                    print(f"  Removed dead tracks: {dead_tracks}")
+                
+                print(f"Result: {len(all_tracks)} total tracks, {len(track_history)} live tracks\n")
 
                 # Draw overlays with track IDs
                 tiles = draw_overlays_with_tracks(rt, boxes, scores, labels, images_bgra, all_tracks_per_cat)
@@ -616,6 +701,10 @@ def run_loop(rt, client):
     except Exception:
         traceback.print_exc()
     finally:
+        # Save tracking history before cleanup
+        if track_history or ego_history:
+            save_tracking_history(track_history, ego_history, "tracking_history.yaml")
+        
         if writer is not None:
             writer.release()
         for fn in (client.destroy_scene, client.destroy_world):
