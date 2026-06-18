@@ -11,7 +11,7 @@ Spawning reuses your own Client, so live sensor settings are identical to traini
 EDIT THE CONFIG BLOCK BELOW. Run from the futr3d root with CARLA already running:
     python realtime/realtime_detect.py
 """
-
+from AB3DMOT.AB3DMOT_libs.model import AB3DMOT
 import importlib
 import os
 import queue
@@ -86,6 +86,44 @@ def build_grid(tiles, h=300):
     pad = [np.pad(t, ((0, 0), (0, w - t.shape[1]), (0, 0))) for t in rs]
     return np.concatenate([np.concatenate(pad[0:3], axis=1),
                            np.concatenate(pad[3:6], axis=1)], axis=0)
+
+
+def add_velocity(img, boxes_3d, scores, labels, lidar2img,
+                 score_thr=0.0, arrow_seconds=1.0, min_speed=0.5):
+    """Overlay velocity arrows + speed text. vx,vy are box tensor cols 7,8 (m/s,
+    LiDAR frame). Arrow length = distance the object travels in `arrow_seconds`."""
+    keep = scores > score_thr
+    b = boxes_3d[keep]
+    if len(b) == 0:
+        return img
+    centers = b.gravity_center.numpy()          # (N,3) box centers, LiDAR frame
+    vels = b.tensor[:, 7:9].numpy()             # (N,2) vx, vy
+
+    def project(pts3):
+        h = np.concatenate([pts3, np.ones((len(pts3), 1))], axis=1)
+        p = (lidar2img @ h.T).T
+        d = p[:, 2].copy()
+        p[:, :2] /= p[:, 2:3] + 1e-6
+        return p[:, :2], d
+
+    tips = centers.copy()
+    tips[:, 0] += vels[:, 0] * arrow_seconds
+    tips[:, 1] += vels[:, 1] * arrow_seconds
+    c2d, c_d = project(centers)
+    t2d, t_d = project(tips)
+
+    for n in range(len(b)):
+        speed = float(np.linalg.norm(vels[n]))   # m/s
+        if c_d[n] < 0.1 or speed < min_speed:
+            continue
+        cx, cy = int(c2d[n, 0]), int(c2d[n, 1])
+        if t_d[n] > 0.1:
+            tx, ty = int(t2d[n, 0]), int(t2d[n, 1])
+            cv2.arrowedLine(img, (cx, cy), (tx, ty), (0, 255, 255), 2,
+                            cv2.LINE_AA, tipLength=0.3)
+        cv2.putText(img, f"{speed * 3.6:.0f} km/h", (cx, cy - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+    return img
 # =============================================================================
 # 1) ONE-TIME SETUP
 # =============================================================================
@@ -232,6 +270,17 @@ def infer_core(rt, images_bgra, pts, ego_tf, ts, sweep_buf, score_thr=SCORE_THR)
     data = collate([data], samples_per_gpu=1)
     result = rt["model"](return_loss=False, rescale=True, **data)
     res = result[0].get("pts_bbox", result[0])
+    #-------------------------------------------------------------
+    # boxes = res["boxes_3d"]
+    # scores = res["scores_3d"]
+    # labels = res["labels_3d"]
+
+    # for i in range(min(10, len(scores))):
+    #     print(f"\nDetection {i}")
+    #     print("Score:", float(scores[i]))
+    #     print("Label:", int(labels[i]))
+    #     print("Box:", boxes.tensor[i].cpu().numpy())
+    #-------------------------------------------------------------
     keep = res["scores_3d"] >= score_thr
     return res["boxes_3d"][keep], res["scores_3d"][keep], res["labels_3d"][keep]
 
@@ -239,16 +288,93 @@ def infer_core(rt, images_bgra, pts, ego_tf, ts, sweep_buf, score_thr=SCORE_THR)
 # =============================================================================
 # 4) VISUALIZATION
 # =============================================================================
-def draw_overlays(rt, boxes, scores, labels, images_bgra):
+def add_track_ids(img, boxes_3d, track_ids, lidar2img, color=(0, 255, 0)):
+    """Overlay track IDs on 3D boxes projected to 2D image.
+    
+    Args:
+        img: Image array to draw on
+        boxes_3d: 3D boxes (N, 7) [h, w, l, x, y, z, yaw] OR Box3D object
+        track_ids: Track IDs (N,)
+        lidar2img: Lidar to image projection matrix (4, 4)
+        color: Color for text (BGR)
+    """
+    if len(boxes_3d) == 0:
+        return img
+    
+    # Get box centers for projection
+    if hasattr(boxes_3d, 'gravity_center'):
+        # mmdet3d Box3D format
+        centers = boxes_3d.gravity_center.numpy()
+    else:
+        # Raw numpy array format: [h, w, l, x, y, z, yaw]
+        centers = boxes_3d[:, 3:6]  # Extract x, y, z
+    
+    # Project centers to image space
+    ones = np.ones((len(centers), 1))
+    pts_h = np.concatenate([centers, ones], axis=1)  # (N, 4)
+    pts_img = (lidar2img @ pts_h.T).T  # (N, 4)
+    
+    # Get 2D coordinates and depth
+    depths = pts_img[:, 2]
+    pts_2d = pts_img[:, :2] / (pts_img[:, 2:3] + 1e-6)  # (N, 2)
+    
+    # Draw track IDs on valid points
+    for i in range(len(track_ids)):
+        if depths[i] > 0.1:  # Only draw if in front of camera
+            x, y = int(pts_2d[i, 0]), int(pts_2d[i, 1])
+            track_id = int(track_ids[i])
+            
+            # Draw text
+            text = f"ID:{track_id}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            thickness = 2
+            text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+            
+            # Draw background for text readability
+            cv2.rectangle(img, (x - 3, y - text_size[1] - 5),
+                         (x + text_size[0] + 3, y + 3), (0, 0, 0), -1)
+            
+            # Draw text
+            cv2.putText(img, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+    
+    return img
+
+
+def draw_overlays_with_tracks(rt, boxes, scores, labels, images_bgra, all_tracks_per_cat):
+    """Draw detection overlays plus track IDs.
+    
+    Args:
+        all_tracks_per_cat: dict mapping class name to array of tracked boxes
+    """
     tiles = []
     for i, cam in enumerate(rt["cam_order"]):
         bgr = images_bgra[cam][:, :, :3].copy()
+        
+        # Draw detection boxes
         vis = project_boxes_to_image(boxes, scores, labels, rt["lidar2img"][i],
                                      bgr, list(rt["classes"]), score_thr=0.0)
+        
+        # Add velocity arrows
+        vis = add_velocity(vis, boxes, scores, labels, rt["lidar2img"][i], score_thr=0.0)
+        
+        # Add track IDs for each category
+        for cat_idx, cat in enumerate(rt["classes"]):
+            if cat in all_tracks_per_cat and len(all_tracks_per_cat[cat]) > 0:
+                cat_boxes_tracked = all_tracks_per_cat[cat]['boxes']
+                cat_track_ids = all_tracks_per_cat[cat]['track_ids']
+                
+                # Draw track IDs on this category
+                vis = add_track_ids(vis, cat_boxes_tracked, cat_track_ids, 
+                                   rt["lidar2img"][i], color=(0, 255, 0))
+        
+        # Add camera label
         cv2.putText(vis, cam, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (255, 255, 255), 2, cv2.LINE_AA)
         tiles.append(vis)
+    
     return tiles
+
 
 
 def show_grid(tiles, h=300):
@@ -317,6 +443,54 @@ def bootstrap_client():
     return client
 
 
+def build_tracker_config():
+    """Create a minimal config object for AB3DMOT initialization."""
+    class MinimalConfig:
+        def __init__(self):
+            self.dataset = "nuScenes"
+            self.det_name = "centerpoint"
+            self.vis = False
+            self.ego_com = 0
+            self.affi_pro = False
+    return MinimalConfig()
+
+
+def create_trackers(classes):
+    """Create trackers for supported categories. Skip unsupported ones."""
+    # Map lowercase class names to AB3DMOT's expected capitalized format
+    class_name_map = {
+        'car': 'Car',
+        'truck': 'Truck',
+        'construction_vehicle': 'Truck',  # Map to Truck as closest match
+        'bus': 'Bus',
+        'trailer': 'Trailer',
+        'motorcycle': 'Motorcycle',
+        'bicycle': 'Bicycle',
+        'pedestrian': 'Pedestrian',
+    }
+    
+    # AB3DMOT supports these categories for nuScenes
+    supported_cats = {'Car', 'Pedestrian', 'Truck', 'Trailer', 'Bus', 'Motorcycle', 'Bicycle'}
+    tracker_cfg = build_tracker_config()
+    trackers = {}
+    
+    for cat in classes:
+        # Map lowercase to capitalized format
+        mapped_cat = class_name_map.get(cat.lower(), None)
+        
+        if mapped_cat and mapped_cat in supported_cats:
+            try:
+                # Suppress verbose logging for tracker setup
+                t = AB3DMOT(tracker_cfg, mapped_cat)
+                print(f"✓ Created tracker for: {cat} -> {mapped_cat} (min_hits={t.min_hits}, max_age={t.max_age})")
+                trackers[cat] = t  # Use original lowercase class name as key
+            except Exception as e:
+                print(f"✗ Could not create tracker for {cat}: {e}")
+    
+    print(f"Active trackers: {list(trackers.keys())}\n")
+    return trackers
+
+
 def run_loop(rt, client):
     import traceback
     world = client.world
@@ -327,6 +501,9 @@ def run_loop(rt, client):
     lidar_actor = by_name["LIDAR_TOP"].get_actor()
 
     keep = {a.id for a in cam_actors} | {lidar_actor.id}
+     
+    # Create tracker for supported categories
+    trackers = create_trackers(rt["classes"])
     for s in client.sensors:
         a = s.get_actor()
         if a is not None and a.id not in keep:
@@ -353,9 +530,78 @@ def run_loop(rt, client):
 
             if tick % INFER_EVERY == 0:
                 boxes, scores, labels = infer_core(rt, images_bgra, pts, ego_tf, ts, sweep_buf)
-                print(f"tick {tick}: {len(scores)} detections")
+                
+                # Track detections per category (only for supported categories)
+                boxes_np = boxes.tensor.cpu().numpy()
+                scores_np = scores.cpu().numpy()
+                labels_np = labels.cpu().numpy()
+                
+                print(f"\n=== Tick {tick} ===")
+                print(f"Detections: {len(scores)}, Trackers: {list(trackers.keys())}")
+                
+                all_tracks = []
+                all_tracks_per_cat = {}  # Store tracks per category for visualization
+                
+                for cat_idx, cat in enumerate(rt["classes"]):
+                    if cat not in trackers:
+                        continue
+                    
+                    cat_mask = labels_np == cat_idx
+                    
+                    # Build detection array for this category
+                    if cat_mask.any():
+                        cat_dets = []
+                        cat_info = []
+                        for i in np.where(cat_mask)[0]:
+                            x, y, z, w, l, h, yaw = boxes_np[i][:7]
+                            score = scores_np[i]
+                            cat_dets.append([h, w, l, x, y, z, yaw])
+                            cat_info.append([score, 0, 0, 0, 0, 0, 0, 0])
+                        cat_dets = np.array(cat_dets)
+                        cat_info = np.array(cat_info)
+                    else:
+                        cat_dets = np.empty((0, 7))
+                        cat_info = np.empty((0, 8))
+                    
+                    print(f"  {cat}: {len(cat_dets)} dets", end="")
+                    
+                    # Call AB3DMOT.track() with proper format
+                    dets_all = {'dets': cat_dets, 'info': cat_info}
+                    try:
+                        tracker = trackers[cat]
+                        results, affi = tracker.track(dets_all, tick, 'carla_realtime')
+                        
+                        if len(results) > 0 and results[0].shape[0] > 0:
+                            tracks_output = results[0]
+                            print(f" -> {tracks_output.shape[0]} tracks")
+                            
+                            # Extract box data and track IDs for visualization
+                            tracked_boxes_list = []
+                            track_ids_list = []
+                            
+                            for t in tracks_output:
+                                h, w, l, x, y, z, yaw, track_id = t[:8]
+                                tracked_boxes_list.append([h, w, l, x, y, z, yaw])
+                                track_ids_list.append(int(track_id))
+                                all_tracks.append([h, w, l, x, y, z, yaw, track_id])
+                            
+                            # Store for visualization
+                            if len(tracked_boxes_list) > 0:
+                                all_tracks_per_cat[cat] = {
+                                    'boxes': np.array(tracked_boxes_list),
+                                    'track_ids': np.array(track_ids_list)
+                                }
+                        else:
+                            print(" -> 0 tracks")
+                    except Exception as e:
+                        print(f" -> ERROR: {e}")
+                
+                print(f"Result: {len(all_tracks)} total tracks\n")
 
-                grid = build_grid(draw_overlays(rt, boxes, scores, labels, images_bgra))
+                # Draw overlays with track IDs
+                tiles = draw_overlays_with_tracks(rt, boxes, scores, labels, images_bgra, all_tracks_per_cat)
+                grid = build_grid(tiles)
+                
                 if writer is None:
                     fh, fw = grid.shape[:2]
                     writer = cv2.VideoWriter("realtime_detections.mp4",
